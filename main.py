@@ -35,9 +35,12 @@ logger = logging.getLogger(__name__)
 
 
 # Stages
-IDLE, WAIT_FOR_ADMIN, WAIT_FOR_SELECT_ROOM, SET_QUEST, NEW_GAME, DEL_GAME, LOAD_GAME, DEL_QUEST = range(8)
+IDLE, USER_CHANGE_GAME, WAIT_FOR_ADMIN, WAIT_FOR_SELECT_ROOM, SET_QUEST, NEW_GAME, DEL_GAME, LOAD_GAME, DEL_QUEST = \
+    range(9)
 
 MAIN_MENU_TEXT = "Ви війшли як адміністратор"
+
+ADMIN_USER = 711094148
 
 prefix_path = '.'
 game_path = join(prefix_path, "games")
@@ -68,7 +71,7 @@ def add_to_file(file_name, text):
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_user.id == 711094148 or update.effective_user.id == 1:
+    if update.effective_user.id == ADMIN_USER:
         return await admin_menu(update, context, False)
     else:
         return await user_menu(update, context)
@@ -114,7 +117,11 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_qu
 async def user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = []
     if 'state' in context.bot_data and context.bot_data['state']:
-        quests = load_from_file(context.bot_data['game_name'])
+        game_name = context.bot_data['game_name']
+        quests = load_from_file(game_name)
+        full_name = update.effective_user.full_name
+        if update.effective_user.id not in context.bot_data["users"]:
+            await context.bot.send_message(ADMIN_USER, f"Гравець {full_name} доєднався до гри {game_name}")
         for i in range(len(quests)):
             keyboard.append([InlineKeyboardButton(str(i+1), callback_data=f"{i}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -122,7 +129,46 @@ async def user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return WAIT_FOR_SELECT_ROOM
     else:
         await context.bot.send_message(update.effective_chat.id, "Гра ще не почалась...")
-        return IDLE
+        return ConversationHandler.END
+
+
+async def user_change_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if "users" in context.bot_data and update.effective_user.id in context.bot_data["users"]:
+        keyboard = [[
+            InlineKeyboardButton("Так", callback_data="yes"),
+            InlineKeyboardButton("Ні", callback_data="no")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(update.effective_chat.id,
+                                       "Ти впевненний що хочеш змінити команду? Підглядати не чесно",
+                                       reply_markup=reply_markup)
+        return USER_CHANGE_GAME
+    else:
+        return await user_menu(update, context)
+
+
+async def select_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show new choice of buttons"""
+    query = update.callback_query
+    await query.answer()
+    task = int(query.data)
+    full_name = update.effective_user.full_name
+    if update.effective_user.id in context.bot_data["users"]:
+        old_task = context.bot_data["users"][update.effective_user.id][1]
+        await context.bot.send_message(ADMIN_USER, f"Гравець {full_name} змінив команду з {old_task} на {task}")
+    else:
+        await context.bot.send_message(ADMIN_USER, f"Гравець {full_name} обрав команду {task + 1}")
+    context.bot_data["users"][update.effective_user.id] = (update.effective_user.full_name, task)
+    return await user_status(update, context)
+
+
+async def user_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    task = context.bot_data["users"][update.effective_user.id][1]
+    quests = load_from_file(context.bot_data["game_name"])
+    await query.edit_message_text(f"Завдання твоєї команди({task + 1}):\n{quests[task]}")
+    return IDLE
 
 
 async def game_not_selected_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -134,6 +180,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer()
     if "game_name" in context.bot_data:
         context.bot_data["state"] = True
+        context.bot_data["users"] = dict()
         await update.callback_query.edit_message_text("starting...")
         return await admin_menu(update, context, False)
     else:
@@ -145,7 +192,18 @@ async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer()
     if "game_name" in context.bot_data:
         context.bot_data["state"] = False
-        await update.callback_query.edit_message_text("stopping...")
+        teams = dict()
+        for user in context.bot_data["users"].values():
+            if user[1] not in teams:
+                teams[user[1]] = []
+            teams[user[1]].append(user[0])
+        text = f"Статистика гри {context.bot_data['game_name']}:\n"
+        for team in teams.items():
+            text += f"Команда {team[0] + 1}:\n" + "\n".join(team[1]) + "\n\n"
+        logger.info(text)
+        await update.callback_query.message.delete()
+        await context.bot.send_message(update.effective_chat.id, text)
+        context.bot_data.pop("users", None)
         return await admin_menu(update, context, False)
     else:
         return await game_not_selected_menu(update, context)
@@ -295,16 +353,6 @@ async def show_quests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return await game_not_selected_menu(update, context)
 
 
-async def select_room(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show new choice of buttons"""
-    query = update.callback_query
-    await query.answer()
-    task = int(query.data)
-    quests = load_from_file(context.bot_data["game_name"])
-    await query.edit_message_text(f"Завдання твоєї команди({task + 1}):\n{quests[task]}")
-    return IDLE
-
-
 async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Returns `ConversationHandler.END`, which tells the
     ConversationHandler that the conversation is over.
@@ -338,6 +386,13 @@ def main() -> None:
         states={
             WAIT_FOR_SELECT_ROOM: [
                 CallbackQueryHandler(select_room),
+            ],
+            IDLE: [
+                CommandHandler("start", user_change_game)
+            ],
+            USER_CHANGE_GAME: [
+                CallbackQueryHandler(user_menu, pattern="^yes$"),
+                CallbackQueryHandler(user_status, pattern="^no$")
             ],
             WAIT_FOR_ADMIN: [
                 CallbackQueryHandler(new_game, pattern="^new_game$"),
